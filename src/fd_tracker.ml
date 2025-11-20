@@ -96,7 +96,7 @@ module State_machine = struct
         let%map watch in
         let event =
           (* Wait a short time before actually interrupting the watch so that libcurl can
-           possibly reuse a connection without waiting for Async state transitions. *)
+             possibly reuse a connection without waiting for Async state transitions. *)
           Clock_ns.Event.run_after
             watch_dwell_time
             (fun { Watch.interrupt; _ } -> Ivar.fill_exn interrupt ())
@@ -196,8 +196,8 @@ let close { contexts; multi_handle = _; watch_dwell_time = _ } unix_fd =
     Option_array.unsafe_set_none contexts (unix_fd |> File_descr.to_int);
     don't_wait_for (Fd.close fd))
   else
-    (* I don't believe this is possible from documentation. If this happens
-       then investigation is needed. *)
+    (* I don't believe this is possible from documentation. If this happens then
+       investigation is needed. *)
     raise_s
       [%message [%here] "BUG: Close called on non-tracked FD" (unix_fd : File_descr.t)]
 ;;

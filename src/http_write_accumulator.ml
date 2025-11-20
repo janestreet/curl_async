@@ -21,10 +21,10 @@ let register ?(buffer_padding = 0) curl deserializer =
      | Accumulating buffer -> Bigbuffer.add_bigstring buffer bstr
      | Uninitialized ->
        let content_length = Curl.get_contentlengthdownload curl |> Float.to_int in
-       (* The most likely scenarios are that content length is known or that
-           writefunction will only be called once: do minimal allocation based on this. If
-           content length is unknown and writefunction is called more than once, the
-           buffer will resize exponentially as needed. *)
+       (* The most likely scenarios are that content length is known or that writefunction
+          will only be called once: do minimal allocation based on this. If content length
+          is unknown and writefunction is called more than once, the buffer will resize
+          exponentially as needed. *)
        if Bigstring.length bstr = content_length
        then t.state <- One_chunk_only (deserializer.map_ephemeral curl bstr)
        else (
@@ -63,8 +63,8 @@ let finalize_exn t curl =
     t.deserializer.map curl bstr
   | One_chunk_only result -> result
   | Uninitialized ->
-    (* This could be possible because docs say writefunction "_may_ be called with
-       zero bytes data if the transferred file is empty", emphasis mine.
+    (* This could be possible because docs say writefunction "_may_ be called with zero
+       bytes data if the transferred file is empty", emphasis mine.
 
        https://curl.se/libcurl/c/CURLOPT_WRITEFUNCTION.html *)
     t.state <- Finalized;
