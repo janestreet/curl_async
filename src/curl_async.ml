@@ -7,13 +7,11 @@ type independent
 type 'perm t =
   { multi_handle : Curl.Multi.mt
   ; results : (Curl.t, Curl.curlCode Ivar.t) Hashtbl.Poly.t
-  (*
-     libcurl gives us a way to associate arbitrary application data with a curl handle,
+  (* libcurl gives us a way to associate arbitrary application data with a curl handle,
      but this is not currently exposed in a typeful way in the available bindings. We use
      an external hash table to accomplish the same thing. While it would be more elegant
      to not need this table, the performance penalty is negligible so we don't care. *)
-  (*
-     The hash and compare functions defined as part of custom blocks (in C) are exposed in
+  (* The hash and compare functions defined as part of custom blocks (in C) are exposed in
      OCaml as polymorphic, so using [Hashtbl.Poly] here is actually the right thing to do.
      If not using Poly ever matters, these operations could instead be plumbed through as
      external functions. *)
