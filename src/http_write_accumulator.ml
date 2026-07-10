@@ -54,10 +54,12 @@ let finalize_exn t curl =
     (* Returning the buffer contents in this way is allowable only if we are certain no
        further buffer mutation will occur. This property is guaranteed by allowed state
        transitions where illegal state transitions will raise an exception. *)
+    let len = Bigbuffer.length buffer in
+    let buffer_contents = Bigbuffer.volatile_contents buffer in
     let bstr =
-      Bigstring.unsafe_sub_shared_of_local
-        ~len:(Bigbuffer.length buffer)
-        (Bigbuffer.volatile_contents buffer)
+      if Bigstring.length buffer_contents = len
+      then buffer_contents
+      else Bigstring.sub_shared ~len buffer_contents
     in
     t.state <- Finalized;
     t.deserializer.map curl bstr

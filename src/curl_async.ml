@@ -54,27 +54,23 @@ let aborted_event =
 ;;
 
 (* Implements use of the libcurl-multi API prescribed by
-   https://curl.se/libcurl/c/libcurl-multi.html *)
+   https://curl.se/libcurl/c/libcurl-multi.html
+
+   The most relevant example code is
+   https://github.com/curl/curl/blob/master/docs/examples/ephiperfifo.c
+*)
 let create () =
   let multi_handle = (* curl_multi_init *) Curl.Multi.create () in
   let t = { multi_handle; results = Hashtbl.Poly.create () } in
-  let fd_tracker = Fd_tracker.create t.multi_handle in
-  Curl.Multi.set_closesocket_function
-    (* https://curl.se/libcurl/c/CURLOPT_CLOSESOCKETFUNCTION.html
-
-       Using this callback to replace libcurl's built-in socket close is necessary because
-       Async insists on managing the lifecycle of a FD it is watching even though it does
-       not own the FD. See documentation in [Fd_tracker]. *)
-    multi_handle
-    (Fd_tracker.close fd_tracker);
+  let on_ready unix_fd curl_event =
+    let (_running_handles : int) = Curl.Multi.action t.multi_handle unix_fd curl_event in
+    check_completions t
+  in
+  let fd_tracker = Fd_tracker.create ~on_ready in
   Curl.Multi.set_socket_function
     (* https://curl.se/libcurl/c/CURLMOPT_SOCKETFUNCTION.html *)
     multi_handle
-    (fun unix_fd poll ->
-       Fd_tracker.emulate_epoll_ctl_for_curl fd_tracker unix_fd poll;
-       (* Schedule the completion check because all completions may not be available
-          before this callback completes. *)
-       Scheduler.(enqueue_job (current_execution_context ())) check_completions t);
+    (fun unix_fd poll -> Fd_tracker.watch_fd_for_curl fd_tracker unix_fd poll);
   Curl.Multi.set_timer_function
     (* https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html *)
     multi_handle
@@ -149,6 +145,131 @@ module Http = struct
     Http_write_accumulator.finalize_exn accumulator curl
   ;;
 
+  let[@inline] http_code_is_success http_code = http_code >= 200 && http_code < 300
+  let headers curl = Curl.get_headers curl [ CURLH_HEADER ] ~request:(-1)
+
+  module Streaming_state = struct
+    type t =
+      { curl : Curl.t
+      ; multi_handle : Curl.Multi.mt
+      ; writer : Bigstring.t Pipe.Writer.t
+      ; headers_ready : unit Ivar.t
+      ; mutable first_chunk_received : bool
+      ; mutable paused : bool
+      ; mutable transfer_done : bool
+      }
+
+    let unpause t =
+      t.paused <- false;
+      Curl.pause t.curl [];
+      Curl.Multi.action_timeout t.multi_handle
+    ;;
+
+    let pause t =
+      t.paused <- true;
+      don't_wait_for
+        (let%map.Deferred () = Pipe.pushback t.writer in
+         if t.paused && not t.transfer_done then unpause t)
+    ;;
+
+    let create ~curl ~multi_handle ~writer ~headers_ready =
+      let t =
+        { curl
+        ; multi_handle
+        ; writer
+        ; headers_ready
+        ; first_chunk_received = false
+        ; paused = false
+        ; transfer_done = false
+        }
+      in
+      (* If the consumer closes the reader, actively wake up curl so the next write
+         callback can return [Curl.Abort]. Without this, a paused transfer would sit
+         forever waiting for the pipe to drain. (A transfer that is neither paused nor
+         actively transferring data still has to rely on libcurl's own timeouts to notice;
+         cancelling such a transfer cleanly would require exposing [Curl.Multi.remove]
+         through [Curl_async], which is out of scope here.) *)
+      don't_wait_for
+        (let%map.Deferred () = Pipe.closed writer in
+         if t.paused && not t.transfer_done then unpause t);
+      t
+    ;;
+
+    let mark_first_chunk_received t =
+      if not t.first_chunk_received
+      then (
+        t.first_chunk_received <- true;
+        Ivar.fill_if_empty t.headers_ready ())
+    ;;
+
+    let mark_transfer_done t =
+      t.transfer_done <- true;
+      Ivar.fill_if_empty t.headers_ready ()
+    ;;
+
+    let can_write t = Deferred.is_determined (Pipe.pushback t.writer)
+  end
+
+  let default_streaming_buffer_size_budget = 16 (* 256kB with curl's 16kB chunks *)
+
+  let create_streaming_writefunction (streaming_state : Streaming_state.t) =
+    stage (fun bstr ->
+      Streaming_state.mark_first_chunk_received streaming_state;
+      match Pipe.is_closed streaming_state.writer with
+      | true -> Curl.Abort
+      | false ->
+        (match Streaming_state.can_write streaming_state with
+         | false ->
+           Streaming_state.pause streaming_state;
+           Curl.Pause
+         | true ->
+           let chunk = Bigstring.copy bstr in
+           Pipe.write_without_pushback streaming_state.writer chunk;
+           Curl.Proceed ()))
+  ;;
+
+  let with_streaming_response t ?streaming_buffer_size_budget curl ~f =
+    let headers_ready = Ivar.create () in
+    let transfer_result = Ivar.create () in
+    let size_budget =
+      Option.value
+        ~default:default_streaming_buffer_size_budget
+        streaming_buffer_size_budget
+    in
+    let body =
+      Pipe_with_writer_error.create_reader ~size_budget (fun writer ->
+        let streaming_state =
+          Streaming_state.create ~curl ~multi_handle:t.multi_handle ~writer ~headers_ready
+        in
+        Curl.set_writefunction_buf
+          curl
+          (create_streaming_writefunction streaming_state |> unstage);
+        let%map.Deferred result = perform t curl in
+        Streaming_state.mark_transfer_done streaming_state;
+        Ivar.fill_exn transfer_result result;
+        result)
+    in
+    (* Wait for headers to be available (first chunk received or transfer complete) *)
+    let%bind.Deferred () = Ivar.read headers_ready in
+    match Deferred.peek (Ivar.read transfer_result) with
+    | Some (Error error) -> Deferred.Or_error.fail error
+    | Some (Ok ()) | None ->
+      let http_code = Curl.get_httpcode curl in
+      let headers = headers curl in
+      let response = { Response.http_code; headers; body } in
+      Monitor.protect
+        (fun () -> f response)
+        ~finally:(fun () ->
+          (* Make sure the body pipe is closed so the writefunction returns [Curl.Abort]
+             if there are still chunks pending, and wait for the underlying transfer to
+             complete before handing control back to the caller. This is what makes it
+             safe for the caller to [Curl.cleanup] the handle once
+             [with_streaming_response] returns. *)
+          Pipe_with_writer_error.close body;
+          let%map.Deferred (_ : unit Or_error.t) = Ivar.read transfer_result in
+          ())
+  ;;
+
   let perform (type response) t ?buffer_padding curl (style : response Response_style.t) =
     match style with
     | Body ->
@@ -157,9 +278,6 @@ module Http = struct
     | Response -> accumulate t ?buffer_padding curl Deserializer.bigstring_response
     | Map deserializer -> accumulate t ?buffer_padding curl deserializer
   ;;
-
-  let[@inline] http_code_is_success http_code = http_code >= 200 && http_code < 300
-  let headers curl = Curl.get_headers curl [ CURLH_HEADER ] ~request:(-1)
 end
 
 module Expert = struct
