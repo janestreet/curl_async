@@ -1,6 +1,7 @@
 (library
  (name curl_async)
  (public_name curl_async)
- (libraries async core core_unix curl)
+ (libraries async core core_unix curl core_unix.linux_ext
+   pipe_with_writer_error)
  (preprocess
   (pps ppx_jane)))

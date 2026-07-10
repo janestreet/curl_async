@@ -44,6 +44,36 @@ module Http : sig
     -> 'a Response_style.t
     -> 'a Deferred.Or_error.t
 
+  (** [with_streaming_response t curl ~f] performs an HTTP request, streams the response
+      body through a [Pipe_with_writer_error.t], and calls [f] on the [Response.t]. [f]
+      runs after the first response chunk is ready. If [f] returns early, the download is
+      aborted.
+
+      A transfer failure partway through becomes the body pipe's writer error.
+
+      This function is most useful if a large file is being transferred and the consumer
+      wants to _not_ buffer it entirely in memory before returning to the caller. For
+      smaller files it's recommended to use [perform].
+
+      When [f] returns (or raises), [with_streaming_response] closes the body pipe and
+      waits for the underlying curl transfer to abort or finish, depending, before
+      returning, so it is safe for callers (notably [Curl_jane.Http.with_curl]) to clean
+      up or reuse the [Curl.t] after this call returns.
+
+      [streaming_buffer_size_budget] is passed to [Pipe.set_size_budget] on the underlying
+      pipe. It counts queued chunks, not bytes; libcurl typically emits ~16KB chunks. The
+      budget is soft: a chunk that completes the budget is still written, and the next
+      callback pauses the transfer (via [Curl.pause]) until the consumer drains the pipe.
+      Defaults to 16 chunks. *)
+  val with_streaming_response
+    :  _ t
+    -> ?streaming_buffer_size_budget:int
+    -> Curl.t
+    -> f:
+         ((Bigstring.t, Error.t) Pipe_with_writer_error.t Response.t
+          -> 'a Deferred.Or_error.t)
+    -> 'a Deferred.Or_error.t
+
   val headers : Curl.t -> (string, string) List.Assoc.t
   val http_code_is_success : int -> bool
 end

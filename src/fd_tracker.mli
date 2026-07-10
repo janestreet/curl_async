@@ -1,18 +1,16 @@
 (** libcurl's multi API expects an application library to watch file descriptors using
-    epoll or similar and invoke a callback when an FD becomes ready. This type of
-    interaction is simple with epoll but unfortunately is difficult in Async, which
-    imposes a state machine in front of FD watching. This is done with the intention of
-    increased safety but in practice requires complex workarounds which are provided by
-    this module.
+    epoll or similar and to invoke a callback when an FD becomes ready. This module
+    contains a dedicated epoll instance that implements this behavior.
 
-    Details:
-
-    There are empirically some unwritten rules of watching FDs with Async that this module
-    must follow:
+    Async provides FD watching directly, but via a wrapper around epoll that imposes
+    well-intentioned but problematic rules, making it unusable for this purpose:
 
     1. Async restricts changes to the state of FD watching to Async cycle boundaries. This
        means that changes to how Async should watch an FD do not take place immediately
-       like they would when using epoll directly.
+       like they would when using epoll directly. Most notably, libcurl will close an FD
+       immediately after a callback informing the external watcher to stop watching, but
+       Async will not immediately stop watching the FD when told to do so. This can result
+       in a top-level exception.
 
     2. Changes to the state of Async FD watching must be externally sequenced by the
        application: most state changes may not be requested unless any previously
@@ -23,43 +21,30 @@
        because libcurl will reuse connections across requests for performance, resulting
        in possibly rapid changes to FD watching state that Async cannot directly handle.
 
-    3. The owner of an FD may not close the FD if Async is watching it. Doing so will
-       result in a top-level exception from the Async scheduler. The application must
-       either remove Async's watching and wait for the resulting state transition before
-       closing the FD or must allow Async to close the FD itself.
+    libcurl gives us https://curl.se/libcurl/c/CURLOPT_CLOSESOCKETFUNCTION.html which can
+    be used to partly work around this issue. However, not all FDs that libcurl needs to
+    have watched are sockets, so this does not actually solve the problem with immediately
+    closed FDs.
 
-    libcurl gives us a hook that lets Async deal with closing sockets:
-    https://curl.se/libcurl/c/CURLOPT_CLOSESOCKETFUNCTION.html. However, this is just for
-    sockets and not all FDs. libcurl also uses socketpairs internally by default, will
-    instruct an external event system to watch socketpair FDs, and will NOT call a
-    registered closesocketfunction to close socketpair FDs. This behavior will cause async
-    to raise. A workaround for this is to build libcurl with the compile-time flag
-    '--disable-socketpair'. This flag is not the default, so async is unlikely to be
-    compatible with a libcurl provided by an OS package manager. It is possible that
-    '--disable-socketpair' has a small negative impact on latency and efficiency.
+    It is possible to build libcurl with '--disable-socketpair' which can be used in
+    conjunction with CLOSESOCKETFUNCTION to reliably work around the closed FD issue. The
+    workaround code is complex (available in history) and there are other uses of libcurl
+    that do not work with this compilation flag, so this is also not a usable solution.
 
-    It is possible that this could all be much simpler with something like an Expert
-    module for Async's FD handling code that would let the developer bypass the internal
-    state machine and just work with epoll. *)
+    Use of a dedicated epoll that is in turn watched by Async is the best solution to this
+    problem that we've found. *)
 
 open! Core
 
 type t
 
-(** Creates an FD tracker to accompany the given libcurl multi handle. There should be one
-    [t] per multi handle.
+(** Creates an FD tracker. There should be one [t] per libcurl multi handle.
 
-    @param watch_dwell_time
-      Wait this long after a request to stop watching a file descriptor before actually
-      performing the request, potentially not unwatching the FD at all if another request
-      to watch is received within this span. This lets libcurl reuse open connetions
-      without needing to wait for Async. Defaults to 100ms. *)
-val create : ?watch_dwell_time:Time_ns.Span.t -> Curl.Multi.mt -> t
+    [~on_ready] is invoked with the ready file descriptor and translated libcurl event
+    status whenever epoll reports readiness for a watched file descriptor. *)
+val create : on_ready:(Core_unix.File_descr.t -> Curl.Multi.fd_status -> unit) -> t
 
-(** Sets watching of a file descriptor into a requested state and invokes
-    [curl_multi_socket_action] on resulting events. Emulates the use of [epoll_ctl] on top
-    of Async. *)
-val emulate_epoll_ctl_for_curl : t -> Core_unix.File_descr.t -> Curl.Multi.poll -> unit
-
-(** Closes an FD in a way that Async FD watching can tolerate without raising. *)
-val close : t -> Core_unix.File_descr.t -> unit
+(** Records the requested watch state for a file descriptor in the dedicated epoll set.
+    When the file descriptor later becomes ready, [create]'s [~on_ready] callback is
+    invoked. *)
+val watch_fd_for_curl : t -> Core_unix.File_descr.t -> Curl.Multi.poll -> unit
